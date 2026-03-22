@@ -182,7 +182,7 @@ async function runCodexReview(prompt, apiKey) {
       'Authorization': `Bearer ${apiKey}`,
     },
     body: JSON.stringify({
-      model: 'o4-mini',
+      model: 'gpt-5.4',
       messages: [{ role: 'user', content: prompt }],
       max_completion_tokens: 16000,
     }),
