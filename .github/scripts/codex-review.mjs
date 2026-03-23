@@ -3,9 +3,15 @@
  *
  * Runs Codex review on a PR with full context from Linear,
  * then posts findings to GitHub (inline), Slack, and Linear.
+ *
+ * Enhanced: Fetches full file contents and repo context (AGENTS.md, README.md)
+ * to give Codex architecture awareness beyond just the diff.
  */
 
 const SLACK_CHANNEL = 'C0AMPN3KBFF'; // #agent-engineering
+const MAX_CHANGED_FILES = 10;
+const MAX_FILE_LINES = 500;
+const MAX_PROMPT_CHARS = 200_000;
 
 async function main() {
   const {
@@ -51,28 +57,48 @@ async function main() {
   console.log('Fetching PR diff...');
   const diff = await fetchDiff(owner, repo, PR_NUMBER, GITHUB_TOKEN);
 
-  // 3. Build the review prompt
-  const reviewPrompt = buildReviewPrompt(PR_TITLE, PR_BODY, linearContext, diff, repo);
+  // 3. Fetch PR head SHA
+  console.log('Fetching PR metadata...');
+  const prHeadSha = await fetchPrHeadSha(owner, repo, PR_NUMBER, GITHUB_TOKEN);
+  console.log(`PR head SHA: ${prHeadSha}`);
 
-  // 4. Call OpenAI API for review
-  console.log('Running Codex review...');
+  // 4. Fetch full file contents for changed files
+  console.log('Fetching changed file list...');
+  const changedFiles = await fetchChangedFiles(owner, repo, PR_NUMBER, GITHUB_TOKEN);
+  console.log(`Changed files: ${changedFiles.length} (fetching up to ${MAX_CHANGED_FILES})`);
+
+  const fullFileContext = await fetchFullFileContents(
+    owner, repo, prHeadSha, changedFiles, GITHUB_TOKEN,
+  );
+
+  // 5. Fetch repository context (AGENTS.md, README.md)
+  console.log('Fetching repository context...');
+  const repoContext = await fetchRepoContext(owner, repo, prHeadSha, GITHUB_TOKEN);
+
+  // 6. Build the review prompt with token-aware truncation
+  const reviewPrompt = buildReviewPrompt(
+    PR_TITLE, PR_BODY, linearContext, diff, repo, fullFileContext, repoContext,
+  );
+
+  // 7. Call OpenAI API for review
+  console.log(`Running Codex review (prompt: ${reviewPrompt.length} chars)...`);
   const review = await runCodexReview(reviewPrompt, OPENAI_API_KEY);
   console.log('Review complete.');
 
-  // 5. Parse findings
+  // 8. Parse findings
   const findings = parseFindings(review);
 
-  // 6. Post to GitHub PR as a review comment
+  // 9. Post to GitHub PR as a review comment
   console.log('Posting to GitHub...');
   await postGitHubReview(owner, repo, PR_NUMBER, review, findings, GITHUB_TOKEN);
 
-  // 7. Post summary to Slack
+  // 10. Post summary to Slack
   if (SLACK_BOT_TOKEN) {
     console.log('Posting to Slack...');
     await postSlackSummary(PR_TITLE, PR_NUMBER, PR_URL, findings, SLACK_BOT_TOKEN);
   }
 
-  // 8. Post to Linear issue
+  // 11. Post to Linear issue
   if (linearIssueApiId && LINEAR_API_KEY) {
     console.log('Posting to Linear...');
     await postLinearComment(linearIssueApiId, PR_TITLE, PR_NUMBER, PR_URL, findings, review, LINEAR_API_KEY);
@@ -142,8 +168,146 @@ async function fetchDiff(owner, repo, prNumber, token) {
   return text;
 }
 
-function buildReviewPrompt(prTitle, prBody, linearContext, diff, repoName) {
-  return `You are a senior code reviewer for TwinTone AI.
+async function fetchPrHeadSha(owner, repo, prNumber, token) {
+  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}`, {
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Accept': 'application/vnd.github+json',
+    },
+  });
+  if (!res.ok) {
+    throw new Error(`Failed to fetch PR metadata: ${res.status}`);
+  }
+  const data = await res.json();
+  return data.head.sha;
+}
+
+async function fetchChangedFiles(owner, repo, prNumber, token) {
+  const files = [];
+  let page = 1;
+
+  // Paginate through all changed files (GitHub returns max 30 per page by default)
+  while (true) {
+    const res = await fetch(
+      `https://api.github.com/repos/${owner}/${repo}/pulls/${prNumber}/files?per_page=100&page=${page}`,
+      {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Accept': 'application/vnd.github+json',
+        },
+      },
+    );
+    if (!res.ok) {
+      console.warn(`Failed to fetch changed files page ${page}: ${res.status}`);
+      break;
+    }
+    const pageFiles = await res.json();
+    if (pageFiles.length === 0) break;
+    files.push(...pageFiles);
+    if (pageFiles.length < 100) break;
+    page += 1;
+  }
+
+  return files;
+}
+
+async function fetchFullFileContents(owner, repo, headSha, changedFiles, token) {
+  // Filter to files that still exist (not deleted) and limit count
+  const eligibleFiles = changedFiles
+    .filter(f => f.status !== 'removed')
+    .slice(0, MAX_CHANGED_FILES);
+
+  const results = await Promise.allSettled(
+    eligibleFiles.map(async (file) => {
+      const filePath = file.filename;
+      try {
+        const res = await fetch(
+          `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURIComponent(filePath)}?ref=${headSha}`,
+          {
+            headers: {
+              'Authorization': `Bearer ${token}`,
+              'Accept': 'application/vnd.github+json',
+            },
+          },
+        );
+        if (!res.ok) {
+          return { path: filePath, content: null, reason: `HTTP ${res.status}` };
+        }
+        const data = await res.json();
+
+        // Skip binary files
+        if (data.encoding !== 'base64' || !data.content) {
+          return { path: filePath, content: null, reason: 'binary or empty' };
+        }
+
+        const decoded = Buffer.from(data.content, 'base64').toString('utf-8');
+        const lineCount = decoded.split('\n').length;
+
+        if (lineCount > MAX_FILE_LINES) {
+          return { path: filePath, content: null, reason: `${lineCount} lines (>${MAX_FILE_LINES} limit)` };
+        }
+
+        return { path: filePath, content: decoded, lineCount };
+      } catch (e) {
+        return { path: filePath, content: null, reason: e.message };
+      }
+    }),
+  );
+
+  const fileContents = results
+    .filter(r => r.status === 'fulfilled')
+    .map(r => r.value);
+
+  // Log skipped files
+  for (const f of fileContents) {
+    if (f.content === null) {
+      console.log(`  Skipped ${f.path}: ${f.reason}`);
+    } else {
+      console.log(`  Fetched ${f.path} (${f.lineCount} lines)`);
+    }
+  }
+
+  return fileContents;
+}
+
+async function fetchRepoContext(owner, repo, headSha, token) {
+  const contextFiles = ['AGENTS.md', 'README.md'];
+  const results = {};
+
+  await Promise.allSettled(
+    contextFiles.map(async (fileName) => {
+      try {
+        const res = await fetch(
+          `https://api.github.com/repos/${owner}/${repo}/contents/${fileName}?ref=${headSha}`,
+          {
+            headers: {
+              'Authorization': `Bearer ${token}`,
+              'Accept': 'application/vnd.github+json',
+            },
+          },
+        );
+        if (!res.ok) {
+          console.log(`  ${fileName}: not found (${res.status})`);
+          return;
+        }
+        const data = await res.json();
+        if (data.encoding === 'base64' && data.content) {
+          const decoded = Buffer.from(data.content, 'base64').toString('utf-8');
+          results[fileName] = decoded;
+          console.log(`  Fetched ${fileName} (${decoded.length} chars)`);
+        }
+      } catch (e) {
+        console.log(`  ${fileName}: fetch failed (${e.message})`);
+      }
+    }),
+  );
+
+  return results;
+}
+
+function buildReviewPrompt(prTitle, prBody, linearContext, diff, repoName, fullFileContext, repoContext) {
+  // Priority sections (always included)
+  const header = `You are a senior code reviewer for TwinTone AI.
 
 ## Pull Request
 - **Title**: ${prTitle}
@@ -164,14 +328,67 @@ For each finding, provide:
 3. What the issue is
 4. How to fix it
 
+You have access to the full file contents (not just the diff) so you can assess:
+- Whether the change is consistent with the rest of the file
+- Whether existing code has similar patterns that should also be updated
+- Whether imports, exports, and dependencies are correct
+
 At the end, provide a summary verdict:
 - **APPROVED**: No critical or important issues found
-- **CHANGES_REQUESTED**: Critical or important issues must be addressed
+- **CHANGES_REQUESTED**: Critical or important issues must be addressed`;
 
-## Code Diff
-\`\`\`diff
-${diff}
-\`\`\``;
+  // Repository context section
+  let repoContextSection = '';
+  if (repoContext && Object.keys(repoContext).length > 0) {
+    const parts = ['## Repository Context'];
+    for (const [fileName, content] of Object.entries(repoContext)) {
+      parts.push(`### ${fileName}\n\`\`\`markdown\n${content}\n\`\`\``);
+    }
+    repoContextSection = parts.join('\n\n');
+  }
+
+  // Diff section (always included)
+  const diffSection = `## Code Diff\n\`\`\`diff\n${diff}\n\`\`\``;
+
+  // Full file context section (may be truncated)
+  let fileContextSection = '';
+  const filesWithContent = fullFileContext.filter(f => f.content !== null);
+  if (filesWithContent.length > 0) {
+    const parts = ['## Full File Context\nBelow are the complete contents of changed files for full context.'];
+    for (const f of filesWithContent) {
+      parts.push(`### ${f.path}\n\`\`\`\n${f.content}\n\`\`\``);
+    }
+    fileContextSection = parts.join('\n\n');
+  }
+
+  // Assemble with token-aware truncation
+  // Priority: header + repoContext + diff > full file context
+  const prioritySections = [header, repoContextSection, diffSection].filter(Boolean).join('\n\n');
+  const priorityLength = prioritySections.length;
+
+  if (priorityLength >= MAX_PROMPT_CHARS) {
+    // Even priority content exceeds limit — return without file context
+    console.warn(`Priority sections already ${priorityLength} chars, skipping full file context`);
+    return prioritySections.slice(0, MAX_PROMPT_CHARS);
+  }
+
+  const remainingBudget = MAX_PROMPT_CHARS - priorityLength;
+
+  if (fileContextSection.length <= remainingBudget) {
+    return [prioritySections, fileContextSection].filter(Boolean).join('\n\n');
+  }
+
+  // Truncate file context to fit within budget
+  if (remainingBudget > 500) {
+    const truncated = fileContextSection.slice(0, remainingBudget - 100)
+      + '\n\n[FULL FILE CONTEXT TRUNCATED — exceeds token budget]';
+    console.warn(`Full file context truncated from ${fileContextSection.length} to ${remainingBudget} chars`);
+    return [prioritySections, truncated].join('\n\n');
+  }
+
+  // Not enough room for any file context
+  console.warn('No budget remaining for full file context');
+  return prioritySections;
 }
 
 async function runCodexReview(prompt, apiKey) {
